@@ -1,8 +1,14 @@
-#[path = "analysis.rs"]
-mod analysis;
-#[path = "config.rs"]
-mod config;
 #[path = "error.rs"]
-mod error;
+pub mod error;
 
-pub use error::Result;
+#[path = "etl-obj.rs"]
+pub mod etl_obj;
+
+pub use error::{Error, Kind};
+
+// #[path = "response.rs"]
+// mod response;
+// #[path = "sync_wrapper.rs"]
+// mod sync_wrapper;
+// #[path = "client.rs"]
+// mod client;

@@ -16,6 +16,10 @@ use url::Url;
 #[allow(unused)]
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// sdk error -> this package error
+pub fn into(err: impl Into<BoxError>, kind: Kind) -> Error {
+    Error::new(kind, Some(err))
+}
 ///
 pub struct Error {
     inner: Box<Inner>,
@@ -27,6 +31,7 @@ struct Inner {
     kind: Kind,
     source: Option<BoxError>,
     url: Option<Url>,
+    key: Option<String>,
     msg: Option<String>,
 }
 
@@ -40,6 +45,7 @@ impl Error {
                 kind,
                 source: source.map(Into::into),
                 url: None,
+                key: None,
                 msg: None,
             }),
         }
@@ -71,6 +77,19 @@ impl Error {
         self.inner.url = None;
         self
     }
+    /// Add a S3 key
+    #[allow(dead_code)]
+    pub fn with_key(mut self, key: impl AsRef<str>) -> Self {
+        self.inner.key = Some(key.as_ref().to_string());
+        self
+    }
+    /// Strip the related message
+    #[allow(dead_code)]
+    pub fn without_key(mut self) -> Self {
+        self.inner.key = None;
+        self
+    }
+
     /// Add a message related to this error (overwriting any existing)
     #[allow(dead_code)]
     pub fn with_msg(mut self, msg: impl AsRef<str>) -> Self {
@@ -102,9 +121,6 @@ impl Error {
     pub fn is_response(&self) -> bool {
         matches!(self.inner.kind, Kind::Response)
     }
-    pub fn is_config(&self) -> bool {
-        matches!(self.inner.kind, Kind::Config)
-    }
     pub fn is_unauthorized(&self) -> bool {
         matches!(self.inner.kind, Kind::Unauthorized)
     }
@@ -128,6 +144,12 @@ impl fmt::Debug for Error {
         if let Some(ref url) = self.inner.url {
             builder.field("url", url);
         }
+        if let Some(ref key) = self.inner.key {
+            builder.field("key", key);
+        }
+        if let Some(ref msg) = self.inner.msg {
+            builder.field("msg", msg);
+        }
         if let Some(ref source) = self.inner.source {
             builder.field("source", source);
         }
@@ -145,7 +167,6 @@ impl fmt::Display for Error {
             Kind::Internal => f.write_str("internal error")?,
             Kind::Request => f.write_str("request error")?,
             Kind::Response => f.write_str("response error")?,
-            Kind::Config => f.write_str("config error")?,
             Kind::Unauthorized => f.write_str("unauthorized")?,
             Kind::TimedOut => f.write_str("timed-out")?,
         };
@@ -173,13 +194,12 @@ impl StdError for Error {
 
 #[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) enum Kind {
+pub enum Kind {
     Decode,
     Builder,
     Internal,
     Request,
     Response,
-    Config,
     Unauthorized,
     TimedOut,
     MissingParameter,
@@ -205,10 +225,6 @@ pub(crate) fn request<E: Into<BoxError>>(e: E, msg: impl AsRef<str>) -> Error {
 #[allow(unused)]
 pub(crate) fn response<E: Into<BoxError>>(e: E, msg: impl AsRef<str>) -> Error {
     Error::new(Kind::Response, Some(e)).with_msg(msg)
-}
-#[allow(unused)]
-pub(crate) fn config<E: Into<BoxError>>(e: E, msg: impl AsRef<str>) -> Error {
-    Error::new(Kind::Config, Some(e)).with_msg(msg)
 }
 #[allow(unused)]
 pub(crate) fn unauthorized<E: Into<BoxError>>(e: E, url: Url, msg: impl AsRef<str>) -> Error {
