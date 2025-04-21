@@ -169,6 +169,7 @@ impl fmt::Display for Error {
             Kind::Response => f.write_str("response error")?,
             Kind::Unauthorized => f.write_str("unauthorized")?,
             Kind::TimedOut => f.write_str("timed-out")?,
+            Kind::MalformedData => f.write_str("malformed data")?,
         };
 
         if let Some(url) = &self.inner.url {
@@ -203,6 +204,7 @@ pub enum Kind {
     Unauthorized,
     TimedOut,
     MissingParameter,
+    MalformedData,
 }
 
 // constructors
@@ -239,6 +241,12 @@ pub(crate) fn timedout<E: Into<BoxError>>(e: E, msg: impl AsRef<str>) -> Error {
 #[allow(unused)]
 pub(crate) fn missing_parameter<E: Into<BoxError>>(e: E, msg: impl AsRef<str>) -> Error {
     Error::new(Kind::MissingParameter, Some(e)).with_msg(msg)
+}
+
+/// constructor for MalformedData error that includes a message
+#[allow(unused)]
+pub(crate) fn malformed_data<E: Into<BoxError>>(e: E, msg: impl AsRef<str>) -> Error {
+    Error::new(Kind::MalformedData, Some(e)).with_msg(msg)
 }
 
 // io::Error helpers

@@ -1,6 +1,3 @@
-/// stop
-/// TODO:
-///
 /// Convert this to an API with the following
 /// * read_from_s3
 /// * save_to_s3
@@ -11,18 +8,12 @@
 /// 2. struct DataFile { bucket, key, display_name, size, last_modified }
 ///
 use aws_sdk_s3::config::{AppName, Region};
-use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
 use aws_sdk_s3::operation::list_buckets::builders::ListBucketsFluentBuilder;
-use aws_sdk_s3::operation::list_objects_v2::builders::{
-    ListObjectsV2FluentBuilder, ListObjectsV2OutputBuilder,
-};
+use aws_sdk_s3::operation::list_objects_v2::builders::ListObjectsV2FluentBuilder;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
-use aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder;
-use aws_sdk_s3::types::error::{InvalidObjectState, NotFound};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::Error;
+use bytes::Bytes;
 use dotenv::dotenv;
-use serde_json::{from_slice, Value};
 
 use lazy_static::lazy_static;
 
@@ -30,35 +21,16 @@ use s3_client::error::Result;
 use s3_client::error::{into, Kind};
 use s3_client::etl_obj::*;
 
-const TEST_PROJECT: &str = "fef57333-67c0-4825-9765-5bf48f3d5f63";
+use serde::Serialize;
+
+// later put these in a yaml file
+//const TEST_PROJECT: &str = "fef57333-67c0-4825-9765-5bf48f3d5f63";
+const TEST_PROJECT: &str = "f2afe5c4-92f0-41c4-a8a6-c0d85ed0b9fd";
 const ETL_OBJ_FILENAME: &str = "etlObj.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().ok();
-
-    let bucket_name = std::env::var("S3_BUCKET_NAME").expect("The bucket name must be set");
-    let region_name = std::env::var("AWS_REGION").expect("The region name must be set");
-    let endpoint_url = std::env::var("S3_HOST_BASE").expect("The host base must be set");
-    // let endpoint_url = std::env::var("S3_HOST_BUCKET").expect("The host bucket must be set");
-    println!("Bucket name: {bucket_name}");
-    println!("Region name: {region_name}");
-    println!("Endpoint url: {endpoint_url}");
-    // let config = aws_config::load_from_env().await;
-
-    let sdk_config = ::aws_config::load_from_env().await;
-    let config = aws_sdk_s3::config::Builder::from(&sdk_config)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(endpoint_url)
-        .force_path_style(false)
-        .app_name(AppName::new("TestAndControl".to_string()).unwrap())
-        .build();
-
-    // output force_path_style
-    // println!("Config look for force_path_style");
-    // println!("{:?}", config);
-
-    let client = Client::from_conf(config);
+    let client = init_client(ENDPOINT_URL.clone()).await;
     // ... make some calls with the client
 
     let response = list_buckets(&client)
@@ -70,54 +42,81 @@ async fn main() -> Result<()> {
         println!("{:?}", bucket.name().unwrap());
     }
 
-    let objects = list_objects(&client, TEST_PROJECT)
-        .send()
-        .await
-        .map_err(|sdk_err| into(sdk_err, Kind::Request))?;
-
-    if let Some(objects) = objects.contents() {
-        println!("📁 ---->>>> List objects");
-        for object in objects.iter() {
-            println!("{:?}", object);
-        }
-        println!("📁 END");
-    }
-
-    // some sort of side effect
-    // call fmap using string -> Option<String>
-    let keys = fmap_obj_key(&objects, |key| {
-        println!("{}", &key);
-        Some(key.to_string())
-    });
-
-    /*
-    for key in keys.iter() {
-        client
-            .get_object()
-            .bucket(BUCKET_NAME.clone())
-            .key(mk_key(TEST_PROJECT, key))
-            // .response_content_type("application/json")
-            .send()
-            .await
-            .map_err(|sdk_err| into(sdk_err, Kind::Request).with_key(key))?;
-    } */
+    let project_keys = list_project_objects(&client, TEST_PROJECT).await?;
+    println!("📁 project keys -------------------------------------- ");
+    dbg!(&project_keys);
 
     println!("📁 diamond filenames -------------------------------------- ");
-    let filenames = list_diamonds(&client, TEST_PROJECT).await?;
+    let filenames = list_diamond_keys(&client, TEST_PROJECT, key_to_filename).await?;
     dbg!(&filenames);
 
     // download a file
-
-    // https://luci-space.lucivia.net/fef57333-67c0-4825-9765-5bf48f3d5f63/shared/diamonds/fef57333-67c0-4825-9765-5bf48f3d5f63/etlObj.json   //
-    // https://luci-space.sfo3.digitaloceanspaces.com
-    let path = diamond_prefix(TEST_PROJECT);
-    let path = format!("luci-space/{path}/etlObj.json");
-    // let path = "luci-space/fef57333-67c0-4825-9765-5bf48f3d5f63/shared/diamonds/fef57333-67c0-4825-9765-5bf48f3d5f63/warehouse.json";
+    let path = ObjectPath::new(TEST_PROJECT, "etlObj.json")
+        .with_diamonds()
+        .with_bucket()
+        .build();
     println!("📁 single file ------------ {}", &path);
 
+    let bytes = download_bytes(&client, &path).await?;
+
+    let v: EtlObject = serde_json::from_slice(&bytes)
+        .map_err(|e| into(e, Kind::MalformedData).with_msg("EtlObject from json"))?;
+    println!("{v}");
+
+    // use client put_object to save the EtlObject v to the path value
+    write_file(&client, TEST_PROJECT, "etlObj_vUploaded.json", &v).await?;
+
+    Ok(())
+}
+
+async fn init_client(endpoint_url: impl AsRef<str>) -> Client {
+    dotenv().ok();
+    let sdk_config = ::aws_config::load_from_env().await;
+    let config = aws_sdk_s3::config::Builder::from(&sdk_config)
+        .region(Region::new("us-east-1"))
+        .endpoint_url(endpoint_url.as_ref())
+        .app_name(AppName::new("TestAndControl".to_string()).unwrap())
+        .build();
+    Client::from_conf(config)
+}
+
+/// Write data to a S3 file from memory
+async fn write_file<T: Serialize>(
+    client: &Client,
+    project_id: impl AsRef<str>,
+    path: impl AsRef<str>,
+    data: &T,
+) -> Result<()> {
+    // serialize the rust data
+    let data = serde_json::to_vec(data).map_err(|e| into(e, Kind::MalformedData))?;
+    let data = Bytes::from(data);
+
+    let path = ObjectPath::new(project_id.as_ref(), path.as_ref())
+        .with_diamonds()
+        .build();
+
+    let _ = client
+        .put_object()
+        .bucket(BUCKET_NAME.clone())
+        .key(&path)
+        .body(data.into())
+        .send()
+        .await
+        .map_err(|sdk_err| into(sdk_err, Kind::Request).with_key(&path))?;
+
+    Ok(())
+}
+
+/// A function that takes a Client and path
+/// and returns the bytes required to deserialize it using serde_json::from_slice
+/// or serde_json::from_reader
+/// let path = "luci-space/fef57333-67c0-4825-9765-5bf48f3d5f63/shared/diamonds/fef57333-67c0-4825-9765-5bf48f3d5f63/warehouse.json";
+/// 🔑 Do not set the bucket value in the client. The path must be fully qualified with the bucket
+///    name luci-space
+async fn download_bytes(client: &Client, path: impl AsRef<str>) -> Result<Vec<u8>> {
     let result = client
         .get_object()
-        .key(&path)
+        .key(path.as_ref())
         .response_content_type("application/json")
         .send()
         .await
@@ -130,199 +129,128 @@ async fn main() -> Result<()> {
         .map_err(|sdk_err| into(sdk_err, Kind::Response))?
         .into_bytes();
 
-    // Temp comment out
-    // let v: EtlObject = serde_json::from_slice(&bytes).map_err(|e| into(e, Kind::Decode))?;
-    // dbg!(v);
-    use s3_client::etl_obj::*;
-    use std::fs::File;
-    use std::io::Read;
-    let path = "/Users/edmund/Downloads/etlObj.json";
-    let mut file = File::open(path) // type
-        .map_err(|err| into(err, Kind::Request))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents) // type
-        .map_err(|err| into(err, Kind::Request))?;
-
-    // Deserialize the JSON data
-    let etl_object: EtlObject =
-        serde_json::from_str(&contents).map_err(|err| into(err, Kind::Request))?;
-    println!("{:#?}", etl_object);
-
-    // let response: &str = std::str::from_utf8(&bytes).map_err(|e| Error::InvalidObjectState(e))?;
-    // let temp: Value = serde_json::from_str(response).unwrap();
-
-    // println!("{:?}", temp);
-
-    /*
-        let data = reader_file(&client, TEST_PROJECT, &path).send().await?;
-    let stream = data
-        .body
-        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-    let stream_reader = StreamReader::new(stream);
-    */
-
-    Ok(())
-}
-
-async fn init_client() -> Result<Client> {
-    dotenv().ok();
-    let bucket_name = std::env::var("S3_BUCKET_NAME").expect("The bucket name must be set");
-    let region_name = std::env::var("AWS_REGION").expect("The region name must be set");
-    let endpoint_url = std::env::var("S3_HOST_BASE").expect("The host base must be set");
-    println!("Bucket name: {bucket_name}");
-    println!("Region name: {region_name}");
-    println!("Endpoint url: {endpoint_url}");
-
-    let sdk_config = ::aws_config::load_from_env().await;
-    let config = aws_sdk_s3::config::Builder::from(&sdk_config)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(endpoint_url)
-        .app_name(AppName::new("TestAndControl".to_string()).unwrap())
-        .build();
-    let client = Client::from_conf(config);
-
-    Ok(client)
-}
-
-/// list objects in a project /shared/diamonds/*.feather among others
-fn list_objects(client: &Client, project_id: impl AsRef<str>) -> ListObjectsV2FluentBuilder {
-    let objects = client
-        .list_objects_v2()
-        .bucket(BUCKET_NAME.clone())
-        .prefix(project_id.as_ref());
-    objects
+    Ok(bytes.to_vec())
 }
 
 fn list_buckets(client: &Client) -> ListBucketsFluentBuilder {
     client.list_buckets()
 }
 
+/// Utility function that extracts the key values from the S3 Objects
 fn fmap_obj_key<F, B>(objects: &ListObjectsV2Output, func: F) -> Vec<B>
 where
-    F: Fn(&str) -> Option<B>,
+    F: Fn(&str) -> B,
 {
     objects
         .contents()
         .map(|objects| {
             objects
                 .iter()
-                .filter_map(|object| (object.key.as_ref()).and_then(|k| func(k)))
+                .filter_map(|object| (object.key.as_ref()).and_then(|k| Some(func(k))))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
 }
 
 /// list filenames from the diamond directory
-async fn list_diamonds(client: &Client, project_id: impl AsRef<str>) -> Result<Vec<String>> {
+async fn list_diamond_keys<F>(
+    client: &Client,
+    project_id: impl AsRef<str>,
+    pp_key_fn: F,
+) -> Result<Vec<String>>
+where
+    F: Fn(&str) -> String + Send + Sync, // The closure takes &str and returns String
+{
     // local fn that extracts filename from collection of objects
-    let objects = list_diamond_objects(client, project_id)
+    let objects = client
+        .list_objects_v2()
+        .bucket(BUCKET_NAME.clone())
+        .prefix(diamonds_path(project_id.as_ref()))
         .send()
         .await
         .map_err(|sdk_err| into(sdk_err, Kind::Request).with_msg("Error listing diamonds"))?;
 
-    Ok(fmap_obj_key(&objects, key_to_filename))
+    Ok(fmap_obj_key(&objects, pp_key_fn))
 }
 
-fn list_diamond_objects(
-    client: &Client,
-    project_id: impl AsRef<str>,
-) -> ListObjectsV2FluentBuilder {
-    client
+async fn list_project_objects(client: &Client, project_id: impl AsRef<str>) -> Result<Vec<String>> {
+    let objects = client
         .list_objects_v2()
         .bucket(BUCKET_NAME.clone())
-        .prefix(diamond_prefix(project_id.as_ref()))
+        .prefix(project_id.as_ref())
+        .send()
+        .await
+        .map_err(|sdk_err| into(sdk_err, Kind::Request).with_msg("Error listing diamonds"))?;
+
+    Ok(fmap_obj_key(&objects, |x| x.to_string()))
 }
 
-/// Write data to a S3 file from memory
-fn write_file(
-    client: &Client,
-    project_id: impl AsRef<str>,
-    path: impl AsRef<str>,
-) -> PutObjectFluentBuilder {
-    client
-        .put_object()
-        .bucket(BUCKET_NAME.clone())
-        .key(mk_key(project_id, path))
+#[derive(Debug)]
+pub struct ObjectPath {
+    inner: String,
+    project_id: String,
 }
 
-/// Read data from a S3 file into memory
-/// Use case in py:  pd.read_feather(io.BytesIO(resp['Body'].read()))
-fn reader_file(
-    client: &Client,
-    project_id: impl AsRef<str>,
-    path: impl AsRef<str>,
-) -> GetObjectFluentBuilder {
-    let path = mk_key(project_id, path);
-    let path = format!("luci-drive/{}", &path);
-    println!("Path: {}", &path);
-    client.get_object().bucket(BUCKET_NAME.clone()).key(&path)
+/// instantiate using the body in mk_key, add methods that use the bodies in with_diamonds and with_bucket
+impl ObjectPath {
+    pub fn new(project_id: impl AsRef<str>, filename: impl AsRef<str>) -> Self {
+        let path = filename.as_ref();
+        // if the first char is a '/' remove it
+        let path = if path.starts_with('/') {
+            &path[1..]
+        } else {
+            path
+        };
+        let inner = format!("{}/{}", project_id.as_ref(), &path);
+        Self {
+            inner,
+            project_id: project_id.as_ref().to_string(),
+        }
+    }
+    pub fn with_diamonds(mut self) -> Self {
+        self.inner = format!("{}/shared/diamonds/{}", self.project_id, self.inner);
+        self
+    }
+    pub fn with_bucket(mut self) -> Self {
+        let bucket_name = BUCKET_NAME.clone();
+        self.inner = format!("{}/{}", bucket_name, self.inner);
+        self
+    }
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+    pub fn build(self) -> String {
+        self.inner
+    }
 }
 
 /// Used to save/retrieve a file to project diamonds folder
-fn diamond_prefix(project_id: impl Into<String>) -> String {
+fn diamonds_path(project_id: impl Into<String>) -> String {
     let pid: String = project_id.into();
     format!("{}/shared/diamonds/{}", pid.clone(), pid.clone())
 }
 
-/// Used to save/retrieve a file on the S3 resource
-fn mk_key(project_id: impl AsRef<str>, path: impl AsRef<str>) -> String {
-    let path = path.as_ref();
-    format!("{}/{}", project_id.as_ref(), &path[1..])
-}
-
-fn key_to_filename(key: &str) -> Option<String> {
-    key.rsplit_once('/')
-        .map(|(_, filename)| filename.to_string())
+/// Utility that extracts filename from object key
+fn key_to_filename(key: &str) -> String {
+    let filename = if let Some(filename) = key.rsplit_once('/').map(|(_, filename)| filename) {
+        filename
+    } else {
+        key
+    };
+    filename.to_string()
 }
 
 lazy_static! {
     pub static ref BUCKET_NAME: String = {
         dotenv().ok();
-        let bucket_name = std::env::var("S3_BUCKET_NAME").expect("The bucket name must be set");
-        bucket_name
+        std::env::var("S3_BUCKET_NAME").expect("The bucket name must be set")
+    };
+    pub static ref REGION_NAME: String = {
+        dotenv().ok();
+        std::env::var("AWS_REGION").expect("The aws_region name must be set")
+    };
+    pub static ref ENDPOINT_URL: String = {
+        dotenv().ok();
+        std::env::var("S3_HOST_BASE").expect("The s3_host_base value must be set")
     };
 }
-/*
-pub async fn list_objects(client: &Client, bucket_name: &str) -> Result<(), Error> {
-    let objects = client.list_objects_v2().bucket(bucket_name).send().await?;
-    println!("Objects in bucket:");
-    for obj in objects.contents() {
-        println!("{:?}", obj.key().unwrap());
-    }
-
-    Ok(())
-} */
-
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum EtlUnit {
-    #[serde(rename = "quality")]
-    Quality(QualityUnit),
-    #[serde(rename = "mvalue")]
-    Measurement(MeasurementUnit),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct QualityUnit {
-    pub subject: String,
-    pub codomain: String,
-    #[serde(rename = "codomain-reducer")]
-    pub codomain_reducer: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct MeasurementUnit {
-    pub subject: String,
-    pub mspan: String,
-    pub mcomps: Vec<String>,
-    pub codomain: String,
-    #[serde(rename = "codomain-reducer")]
-    pub codomain_reducer: String,
-    #[serde(rename = "slicing-reducer")]
-    pub slicing_reducer: String,
-}
-
-type EtlUnits = HashMap<String, EtlUnit>;
